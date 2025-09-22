@@ -1,5 +1,3 @@
-# teleport
-MVP for Teleport
 # Auth0 Workflow Automation MVP - Design Document
 
 **Date:** September 2025  
