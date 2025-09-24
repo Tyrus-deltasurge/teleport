@@ -19,7 +19,17 @@ The MVP will deliver three main workflows:
 
 I'm intentionally keeping this simple - no multi-tenant support, no RBACs management, no automated secret rotation (yet), and I'll use GitHub Artifacts for Terraform state instead of setting up an Amazon S3 bucket. These can all be addressed in a production version.
 
+
+
+
 ## Technical Approach
+
+### Change Review Process
+- All Terraform changes go through `terraform plan` in PR before apply
+- Plan output is reviewed in GitHub Actions logs
+- Only merged PRs trigger `terraform apply` to main
+- Manual approval required for production changes
+
 
 ### Infrastructure Setup
 
@@ -33,13 +43,14 @@ provider "auth0" {
 }
 ```
 
-For security, I'm going with WebAuthn as the primary MFA method - it's phishing-resistant and provides a better user experience than SMS or email codes. TOTP will be available as a fallback:
+For security, I'll implement WebAuth, a phishing-resistant MFA method that is on Auth0's free tier:
 
 ```hcl
 resource "auth0_guardian" {
   policy = "all-applications"  # MFA everywhere, no exceptions
   webauthn_roaming { enabled = true }
   otp { enabled = true }
+ # SMS and email disabled for non-phishing 
 }
 ```
 
@@ -72,10 +83,29 @@ I'm structuring this MVP with three separate workflows:
 
 **OSS Grafana** - Configuration only:
 - Not calling Grafana APIs directly
-- Generating `grafana.ini` config file with OIDC settings
 - Grafana will consume Auth0's OIDC endpoints
 
 The API has a 15 req/sec rate limit, so I'll add delays between operations. 
+
+**OSS Grafana** -Docker Compose file with the OIDC settings:
+yaml
+version: '3.8'
+
+services:
+  grafana:
+    image: grafana/grafana-oss:latest
+    ports:
+      - '3000:3000'
+    environment:
+      - GF_AUTH_GENERIC_OAUTH_ENABLED=true
+      - GF_AUTH_GENERIC_OAUTH_NAME=Auth0
+      - GF_AUTH_GENERIC_OAUTH_CLIENT_ID=<PLACEHOLDER_CLIENT_ID>
+      - GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET=<PLACEHOLDER_CLIENT_SECRET>
+      - GF_AUTH_GENERIC_OAUTH_SCOPES=openid profile email
+      - GF_AUTH_GENERIC_OAUTH_AUTH_URL=https://<PLACEHOLDER_DOMAIN>/authorize
+      - GF_AUTH_GENERIC_OAUTH_TOKEN_URL=https://<PLACEHOLDER_DOMAIN>/oauth/token
+      - GF_AUTH_GENERIC_OAUTH_API_URL=https://<PLACEHOLDER_DOMAIN>/userinfo
+      - `GF_AUTH_GENERIC_OAUTH_ALLOW_SIGN_UP=true
 
 ## Security Considerations
 
@@ -83,7 +113,7 @@ The API has a 15 req/sec rate limit, so I'll add delays between operations.
 Going with a defense-in-depth approach:
 - WebAuthn for phishing resistance (no passwords to steal)
 - Enforcing MFA on all applications
-- Short session timeouts (8 hours active, 4 hours idle)
+- Short session timeouts ( 4 hours idle)
 - Rotating refresh tokens
 
 ### Secrets Management
@@ -93,7 +123,22 @@ Everything sensitive goes in GitHub Secrets and (gitignore):
 - AUTH0_CLIENT_SECRET
 - AUTH0_API_TOKEN
 
-No credentials in code, ever. I'll also scope tokens to the minimum required permissions for each workflow.
+### Terraform Tenant & App Management
+
+Auth0 Scopes:
+
+- read: tenant_settings, update: tenant_settings (Sessions)
+
+- read: guardian_factors, update: guardian_factors (MFA/WebAuth)
+
+### Grafana App Scopes:
+
+-openid profile email
+-read: clients, create: clients, update: clients, delete: clients
+
+### User Registration for script:
+
+read: users, create: users, update: users
 
 ### Attack Protection
 Setting up Auth0's built-in protections:
@@ -106,13 +151,18 @@ Setting up Auth0's built-in protections:
 The user registration script will follow this flow:
 ```bash
 # Pseudo code for clarity
+```
 for each user in CSV:
+  - Check if user exists via /users-by-email endpoint
+  - If exists: log "User already exists" and skip
+  - If new: proceed with creation
   - Generate secure temp password
   - Create user via API
   - Send password reset email
   - Enable MFA requirement
   - Sleep 1 second (rate limiting)
-```
+
+    ```
 
 For Grafana integration, I'll generate a complete config file artifact that includes the OIDC settings, so anyone can just drop it into their Grafana instance and it works.
 
@@ -121,22 +171,19 @@ For Grafana integration, I'll generate a complete config file artifact that incl
 Things that will probably go wrong and how I'll handle them:
 
 - **Duplicate users**: Check if they exist before creating
-- **State conflicts**: Always download the latest state artifact before running Terraform
 - **Rate limiting**: Exponential backoff with max 3 retries
-- **Partial failures**: Log and continue - don't let one bad user stop the whole batch
 - **Concurrent workflows**: Use GitHub's concurrency groups to prevent race conditions
 
 ## Trade-offs & TODOs
 
 I'm making some deliberate simplifications for the MVP:
 
-| MVP Approach | Production Approach |
-|--------------|-------------------|
-| State in GitHub Artifacts | S3 with DynamoDB 
-| Manual secret rotation | AWS Secrets Manager |
-| No role management | RBAC with groups and permissions |
+| MVP Approach | 
+|--------------|
+| Manual secret rotation | 
+| No role management | 
 
-These will all be marked with TODO comments in the code so they're easy to find and upgrade later.
+
 
 ## Success Criteria
 
@@ -146,13 +193,5 @@ The implementation works if:
 - New users get their password reset emails
 - All three workflows run green
 - No credentials appear in any logs
-
-## Questions
-
-A few things I'd like your input on:
-
-1. Is requiring WebAuthn too aggressive for an MVP? Should I allow password + MFA as an option initially?
-2. Any specific Auth0 attack protection settings you've found particularly effective?
-3. Should the user CSV include any additional metadata fields beyond email and name?
 
 ---
